@@ -1,0 +1,465 @@
+diff -ruN a/kernel/common/inc/nv-compat-70.h b/kernel/common/inc/nv-compat-70.h
+--- a/kernel/common/inc/nv-compat-70.h	1970-01-01 08:00:00.000000000 +0800
++++ b/kernel/common/inc/nv-compat-70.h	2026-11-07 20:47:23.223731690 +0800
+@@ -0,0 +1,44 @@
++/*
++ * Linux 7.0 compatibility shims for the 535.161.05 vGPU kernel modules.
++ *
++ * 内核 7.0 的若干改动使上游 conftest 探测失效或 API 被直接移除，这里统一收敛：
++ *   - struct vm_area_struct.vm_flags 变为 const（与 vma_flags_t flags 组成 union），
++ *     conftest 通过 offsetof(__vm_flags) 的探测不再命中，显式置位。
++ *   - in_irq() 被移除，等价 API 为 in_hardirq()。
++ *   - del_timer_sync() 更名为 timer_delete_sync()。
++ */
++
++#ifndef __NV_COMPAT_70_H__
++#define __NV_COMPAT_70_H__
++
++#include <linux/version.h>
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++
++#ifndef NV_VM_AREA_STRUCT_HAS_CONST_VM_FLAGS
++#define NV_VM_AREA_STRUCT_HAS_CONST_VM_FLAGS 1
++#endif
++
++#ifndef in_irq
++#define in_irq() in_hardirq()
++#endif
++
++#ifndef del_timer_sync
++#define del_timer_sync(timer) timer_delete_sync(timer)
++#endif
++
++#ifndef no_llseek
++#define no_llseek noop_llseek
++#endif
++
++/*
++ * 7.0: vfio 核心接管 VFIO_DEVICE_GET_REGION_INFO，region 信息改由
++ * vfio_device_ops::get_region_info_caps 回调提供。
++ */
++#ifndef NV_VFIO_DEVICE_OPS_HAS_GET_REGION_INFO_CAPS
++#define NV_VFIO_DEVICE_OPS_HAS_GET_REGION_INFO_CAPS 1
++#endif
++
++#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0) */
++
++#endif /* __NV_COMPAT_70_H__ */
+diff -ruN a/kernel/common/inc/nv-linux.h b/kernel/common/inc/nv-linux.h
+--- a/kernel/common/inc/nv-linux.h	2024-01-26 03:08:32.000000000 +0800
++++ b/kernel/common/inc/nv-linux.h	2026-11-07 18:36:06.939337788 +0800
+@@ -28,6 +28,7 @@
+ #include "nv.h"
+ #include "nv-ioctl-numa.h"
+ #include "conftest.h"
++#include "nv-compat-70.h"
+ 
+ #include "nv-lock.h"
+ #include "nv-pgprot.h"
+diff -ruN a/kernel/common/inc/nv-mm.h b/kernel/common/inc/nv-mm.h
+--- a/kernel/common/inc/nv-mm.h	2024-01-26 03:08:33.000000000 +0800
++++ b/kernel/common/inc/nv-mm.h	2026-11-07 18:38:25.572957010 +0800
+@@ -295,7 +295,16 @@
+ static inline void nv_vm_flags_set(struct vm_area_struct *vma, vm_flags_t flags)
+ {
+ #if defined(NV_VM_AREA_STRUCT_HAS_CONST_VM_FLAGS)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++    /*
++     * 7.0: vm_flags_set() 内部调用 __vma_start_write()，该符号是 GPL-only，
++     * 而 nvidia.ko 非 GPL 许可。此处均在 ->mmap() 阶段调用，VMA 尚未挂入
++     * VMA 树，因此使用内核提供的无锁版本 __vm_flags_mod()。
++     */
++    __vm_flags_mod(vma, flags, 0);
++#else
+     vm_flags_set(vma, flags);
++#endif
+ #else
+     vma->vm_flags |= flags;
+ #endif
+@@ -304,7 +313,12 @@
+ static inline void nv_vm_flags_clear(struct vm_area_struct *vma, vm_flags_t flags)
+ {
+ #if defined(NV_VM_AREA_STRUCT_HAS_CONST_VM_FLAGS)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++    /* 同上：避开 GPL-only 的 __vma_start_write() */
++    __vm_flags_mod(vma, 0, flags);
++#else
+     vm_flags_clear(vma, flags);
++#endif
+ #else
+     vma->vm_flags &= ~flags;
+ #endif
+diff -ruN a/kernel/conftest.sh b/kernel/conftest.sh
+--- a/kernel/conftest.sh	2024-01-26 03:08:36.000000000 +0800
++++ b/kernel/conftest.sh	2026-11-07 18:39:04.518729736 +0800
+@@ -89,7 +89,7 @@
+     ISYSTEM=`$CC -print-file-name=include 2> /dev/null`
+     BASE_CFLAGS="-O2 -D__KERNEL__ \
+ -DKBUILD_BASENAME=\"#conftest$$\" -DKBUILD_MODNAME=\"#conftest$$\" \
+--nostdinc -isystem $ISYSTEM \
++-nostdinc -isystem $ISYSTEM -fms-extensions \
+ -Wno-implicit-function-declaration -Wno-strict-prototypes"
+ 
+     if [ "$OUTPUT" != "$SOURCES" ]; then
+@@ -3104,6 +3104,18 @@
+             #
+             CODE="
+             $CONFTEST_PREAMBLE
++            #include <linux/version.h>
++
++            /*
++             * 7.0 起 enable_apicv 以 EXPORT_SYMBOL_GPL_FOR(..., \"kvm-amd,kvm-intel\")
++             * 导出到 module: 命名空间，modpost 禁止外部模块导入该命名空间，
++             * 因此这里强制探测失败，APICV/irq_bypass 路径在 7.0 上编译剔除
++             * （vGPU 仍通过常规 irqfd 注入中断，功能不受影响）。
++             */
++            #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++            #error enable_apicv lives in the KVM module namespace and cannot be imported
++            #endif
++
+             #include <asm/kvm_host.h>
+ 
+             bool is_enable_apicv_present() {
+diff -ruN a/kernel/Kbuild b/kernel/Kbuild
+--- a/kernel/Kbuild	2024-01-26 03:08:33.000000000 +0800
++++ b/kernel/Kbuild	2026-11-07 18:35:03.754090686 +0800
+@@ -62,69 +62,71 @@
+ 
+ 
+ #
+-# Define CFLAGS that apply to all the NVIDIA kernel modules. EXTRA_CFLAGS
++# Define CFLAGS that apply to all the NVIDIA kernel modules. ccflags-y
+ # is deprecated since 2.6.24 in favor of ccflags-y, but we need to support
+ # older kernels which do not have ccflags-y. Newer kernels append
+-# $(EXTRA_CFLAGS) to ccflags-y for compatibility.
++# $(ccflags-y) to ccflags-y for compatibility.
+ #
+ 
+-EXTRA_CFLAGS += -I$(src)/common/inc
+-EXTRA_CFLAGS += -I$(src)
+-EXTRA_CFLAGS += -Wall $(DEFINES) $(INCLUDES) -Wno-cast-qual -Wno-error -Wno-format-extra-args
+-EXTRA_CFLAGS += -D__KERNEL__ -DMODULE -DNVRM
+-EXTRA_CFLAGS += -DNV_VERSION_STRING=\"535.161.05\"
++ccflags-y += -I$(src)/common/inc
++ccflags-y += -I$(src)
++ccflags-y += -Wall $(DEFINES) $(INCLUDES) -Wno-cast-qual -Wno-error -Wno-format-extra-args
++ccflags-y += -D__KERNEL__ -DMODULE -DNVRM
++# 内核 7.0 起 KBUILD_CFLAGS 含 -fms-extensions（fs.h 用匿名 struct 成员）
++ccflags-y += -fms-extensions
++ccflags-y += -DNV_VERSION_STRING=\"535.161.05\"
+ 
+ ifneq ($(SYSSRCHOST1X),)
+- EXTRA_CFLAGS += -I$(SYSSRCHOST1X)
++ ccflags-y += -I$(SYSSRCHOST1X)
+ endif
+ 
+-EXTRA_CFLAGS += -Wno-unused-function
++ccflags-y += -Wno-unused-function
+ 
+ ifneq ($(NV_BUILD_TYPE),debug)
+- EXTRA_CFLAGS += -Wuninitialized
++ ccflags-y += -Wuninitialized
+ endif
+ 
+-EXTRA_CFLAGS += -fno-strict-aliasing
++ccflags-y += -fno-strict-aliasing
+ 
+ ifeq ($(ARCH),arm64)
+- EXTRA_CFLAGS += -mstrict-align
++ ccflags-y += -mstrict-align
+ endif
+ 
+ ifeq ($(NV_BUILD_TYPE),debug)
+- EXTRA_CFLAGS += -g
+- EXTRA_CFLAGS += $(call cc-option,-gsplit-dwarf,)
++ ccflags-y += -g
++ ccflags-y += $(call cc-option,-gsplit-dwarf,)
+ endif
+ 
+-EXTRA_CFLAGS += -ffreestanding
++ccflags-y += -ffreestanding
+ 
+ ifeq ($(ARCH),arm64)
+- EXTRA_CFLAGS += -mgeneral-regs-only -march=armv8-a
+- EXTRA_CFLAGS += $(call cc-option,-mno-outline-atomics,)
++ ccflags-y += -mgeneral-regs-only -march=armv8-a
++ ccflags-y += $(call cc-option,-mno-outline-atomics,)
+ endif
+ 
+ ifeq ($(ARCH),x86_64)
+- EXTRA_CFLAGS += -mno-red-zone -mcmodel=kernel
++ ccflags-y += -mno-red-zone -mcmodel=kernel
+ endif
+ 
+ ifeq ($(ARCH),powerpc)
+- EXTRA_CFLAGS += -mlittle-endian -mno-strict-align -mno-altivec
++ ccflags-y += -mlittle-endian -mno-strict-align -mno-altivec
+ endif
+ 
+-EXTRA_CFLAGS += -DNV_UVM_ENABLE
+-EXTRA_CFLAGS += $(call cc-option,-Werror=undef,)
+-EXTRA_CFLAGS += -DNV_SPECTRE_V2=$(NV_SPECTRE_V2)
+-EXTRA_CFLAGS += -DNV_KERNEL_INTERFACE_LAYER
++ccflags-y += -DNV_UVM_ENABLE
++ccflags-y += $(call cc-option,-Werror=undef,)
++ccflags-y += -DNV_SPECTRE_V2=$(NV_SPECTRE_V2)
++ccflags-y += -DNV_KERNEL_INTERFACE_LAYER
+ 
+ #
+ # Detect SGI UV systems and apply system-specific optimizations.
+ #
+ 
+ ifneq ($(wildcard /proc/sgi_uv),)
+- EXTRA_CFLAGS += -DNV_CONFIG_X86_UV
++ ccflags-y += -DNV_CONFIG_X86_UV
+ endif
+ 
+ ifdef VGX_FORCE_VFIO_PCI_CORE
+- EXTRA_CFLAGS += -DNV_VGPU_FORCE_VFIO_PCI_CORE
++ ccflags-y += -DNV_VGPU_FORCE_VFIO_PCI_CORE
+ endif
+ 
+ #
+@@ -151,7 +153,7 @@
+ 
+ NV_CFLAGS_FROM_CONFTEST := $(shell $(NV_CONFTEST_CMD) build_cflags)
+ 
+-NV_CONFTEST_CFLAGS = $(NV_CFLAGS_FROM_CONFTEST) $(EXTRA_CFLAGS) -fno-pie
++NV_CONFTEST_CFLAGS = $(NV_CFLAGS_FROM_CONFTEST) $(ccflags-y) -fno-pie
+ 
+ NV_CONFTEST_COMPILE_TEST_HEADERS := $(obj)/conftest/macros.h
+ NV_CONFTEST_COMPILE_TEST_HEADERS += $(obj)/conftest/functions.h
+diff -ruN a/kernel/nvidia/nv-dma.c b/kernel/nvidia/nv-dma.c
+--- a/kernel/nvidia/nv-dma.c	2024-01-26 03:08:32.000000000 +0800
++++ b/kernel/nvidia/nv-dma.c	2026-11-07 18:36:06.939438767 +0800
+@@ -796,7 +796,15 @@
+ #endif
+     }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++    /*
++     * 7.0: dma_map_ops::map_resource 被移除，dma_map_resource() 统一由
++     * dma-direct 实现，ops 非空即可认为可用。
++     */
++    return NV_TRUE;
++#else
+     return (ops->map_resource != NULL);
++#endif
+ #else
+     return NV_FALSE;
+ #endif
+diff -ruN a/kernel/nvidia/nvidia.Kbuild b/kernel/nvidia/nvidia.Kbuild
+--- a/kernel/nvidia/nvidia.Kbuild	2024-01-26 03:08:33.000000000 +0800
++++ b/kernel/nvidia/nvidia.Kbuild	2026-11-07 18:40:31.337879640 +0800
+@@ -41,7 +41,7 @@
+ NVIDIA_BINARY_OBJECT_O := nvidia/nv-kernel.o
+ 
+ quiet_cmd_symlink = SYMLINK $@
+- cmd_symlink = ln -sf $< $@
++ cmd_symlink = ln -sf $(abspath $<) $@
+ 
+ targets += $(NVIDIA_BINARY_OBJECT_O)
+ 
+diff -ruN a/kernel/nvidia/nv-pci.c b/kernel/nvidia/nv-pci.c
+--- a/kernel/nvidia/nv-pci.c	2026-11-07 18:24:58.000000000 +0800
++++ b/kernel/nvidia/nv-pci.c	2026-11-07 18:36:06.939511143 +0800
+@@ -211,7 +211,13 @@
+             goto failed;
+         }
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7,0,0)
++        /*
++         * 7.0: struct iommu_fwspec 移除了 ops 成员，改用 device_iommu_mapped()
++         * 判断该设备是否真正经过 IOMMU 映射。
++         */
++        if (!device_iommu_mapped(&pci_dev->dev))
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
+         const struct iommu_ops *ops = NULL;
+         struct iommu_fwspec *fwspec = NULL;
+         fwspec = dev_iommu_fwspec_get(&pci_dev->dev);
+diff -ruN a/kernel/nvidia/os-mlock.c b/kernel/nvidia/os-mlock.c
+--- a/kernel/nvidia/os-mlock.c	2024-01-26 03:08:32.000000000 +0800
++++ b/kernel/nvidia/os-mlock.c	2026-11-07 18:38:25.573017329 +0800
+@@ -30,7 +30,53 @@
+                                 unsigned long address,
+                                 unsigned long *pfn)
+ {
+-#if defined(NV_UNSAFE_FOLLOW_PFN_PRESENT)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++    /*
++     * 7.0 移除了 follow_pfn()，官方替代 follow_pfnmap_start() 是 GPL-only 导出，
++     * nvidia.ko 无法使用。这里做一次只读的页表遍历，语义与 follow_pfn() 一致：
++     * 成功返回 0 并给出 pfn，失败返回负值。
++     * 调用方（os_lookup_user_io_memory）已持有 mmap_lock 读锁。
++     */
++    struct mm_struct *mm = vma->vm_mm;
++    pgd_t *pgd;
++    p4d_t *p4d;
++    pud_t *pud;
++    pmd_t *pmd;
++    pte_t *pte;
++
++    pgd = pgd_offset(mm, address);
++    if (pgd_none(*pgd) || pgd_bad(*pgd))
++        return -EINVAL;
++
++    p4d = p4d_offset(pgd, address);
++    if (p4d_none(*p4d))
++        return -EINVAL;
++
++    pud = pud_offset(p4d, address);
++    if (pud_none(*pud))
++        return -EINVAL;
++    if (pud_leaf(*pud))
++    {
++        *pfn = pud_pfn(*pud);
++        return 0;
++    }
++
++    pmd = pmd_offset(pud, address);
++    if (pmd_none(*pmd))
++        return -EINVAL;
++    if (pmd_leaf(*pmd))
++    {
++        *pfn = pmd_pfn(*pmd);
++        return 0;
++    }
++
++    pte = pte_offset_kernel(pmd, address);
++    if (!pte_present(*pte))
++        return -EINVAL;
++
++    *pfn = pte_pfn(*pte);
++    return 0;
++#elif defined(NV_UNSAFE_FOLLOW_PFN_PRESENT)
+     return unsafe_follow_pfn(vma, address, pfn);
+ #else
+     return follow_pfn(vma, address, pfn);
+diff -ruN a/kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.c b/kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.c
+--- a/kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.c	2026-11-07 18:24:58.000000000 +0800
++++ b/kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.c	2026-11-07 20:47:23.220598904 +0800
+@@ -957,7 +957,7 @@
+     return ((is_vf && is_bar0_64b) ? PCI_BASE_ADDRESS_5 : PCI_BASE_ADDRESS_4);
+ }
+ 
+-static int nv_vgpu_vfio_region_info(vgpu_dev_t *vgpu_dev,
++int nv_vgpu_vfio_region_info(vgpu_dev_t *vgpu_dev,
+                                     struct vfio_region_info *region_info,
+                                     struct vfio_info_cap *caps)
+ {
+@@ -2904,7 +2904,9 @@
+ #endif
+         eventfd_ctx_put(vgpu_dev->intr_info.msix[vector].trigger);
+         vgpu_dev->intr_info.msix[vector].trigger = NULL;
++#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+         vgpu_dev->intr_info.msix[vector].producer.token = NULL;
++#endif
+         free_irq(vgpu_dev->intr_info.msix[vector].allocated_irq, vgpu_dev);
+         vgpu_dev->intr_info.msix[vector].allocated_irq = INVALID_IRQ;
+     }
+@@ -2928,18 +2930,31 @@
+     vgpu_dev->intr_info.msix[vector].allocated_irq = irq;
+     vgpu_dev->intr_info.msix[vector].trigger = trigger;
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++    /* 7.0: producer.token 被移除，eventfd 与 irq 改为注册时传入 */
++    vgpu_dev->intr_info.msix[vector].producer.eventfd = trigger;
++    vgpu_dev->intr_info.msix[vector].producer.irq = irq;
++#else
+     vgpu_dev->intr_info.msix[vector].producer.token = trigger;
+     vgpu_dev->intr_info.msix[vector].producer.irq = irq;
++#endif
+ 
+ #if defined(NV_ENABLE_APICV_PRESENT)
+     if (enable_apicv == NV_TRUE)
+     {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
++        ret = irq_bypass_register_producer(&vgpu_dev->intr_info.msix[vector].producer,
++                                           trigger, irq);
++#else
+         ret = irq_bypass_register_producer(&vgpu_dev->intr_info.msix[vector].producer);
++#endif
+         if (ret)
+         {
+             NV_VGPU_DEV_LOG(VGPU_INFO, vgpu_dev,
+                             "Failed to register producer irq token %d\n", ret);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+             vgpu_dev->intr_info.msix[vector].producer.token = NULL;
++#endif
+         }
+     }
+ #endif
+@@ -2965,7 +2980,9 @@
+ #endif
+                 eventfd_ctx_put(vgpu_dev->intr_info.msix[i].trigger);
+                 vgpu_dev->intr_info.msix[i].trigger = NULL;
++#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+                 vgpu_dev->intr_info.msix[i].producer.token = NULL;
++#endif
+                 free_irq(vgpu_dev->intr_info.msix[i].allocated_irq, vgpu_dev);
+                 vgpu_dev->intr_info.msix[i].allocated_irq = INVALID_IRQ;
+             }
+@@ -5520,7 +5537,9 @@
+ MODULE_INFO(supported, "external");
+ MODULE_VERSION(NV_VERSION_STRING);
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0)
++MODULE_IMPORT_NS("IOMMUFD");
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
+ MODULE_IMPORT_NS(IOMMUFD);
+ #endif
+ 
+diff -ruN a/kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.h b/kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.h
+--- a/kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.h	2024-01-26 03:08:33.000000000 +0800
++++ b/kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.h	2026-11-07 20:47:23.220899458 +0800
+@@ -81,6 +81,9 @@
+ int        nv_vgpu_vfio_mmap(struct vgpu_dev_s *, struct vm_area_struct *);
+ long       nv_vgpu_vfio_ioctl(struct vgpu_dev_s *, unsigned int,
+                                      unsigned long);
++int        nv_vgpu_vfio_region_info(struct vgpu_dev_s *,
++                                    struct vfio_region_info *,
++                                    struct vfio_info_cap *);
+ ssize_t    nv_vgpu_vfio_read(struct vgpu_dev_s *, char __user *, size_t,
+                                     loff_t *);
+ ssize_t    nv_vgpu_vfio_write(struct vgpu_dev_s *, const char __user *,
+diff -ruN a/kernel/nvidia-vgpu-vfio/vgpu-vfio-mdev.c b/kernel/nvidia-vgpu-vfio/vgpu-vfio-mdev.c
+--- a/kernel/nvidia-vgpu-vfio/vgpu-vfio-mdev.c	2026-11-07 18:24:58.000000000 +0800
++++ b/kernel/nvidia-vgpu-vfio/vgpu-vfio-mdev.c	2026-11-07 20:47:23.223626345 +0800
+@@ -320,6 +320,24 @@
+     nv_vgpu_vfio_close(vgpu_dev);
+ }
+ 
++#if defined(NV_VFIO_DEVICE_OPS_HAS_GET_REGION_INFO_CAPS)
++/*
++ * 7.0 起 vfio 核心自己处理 VFIO_DEVICE_GET_REGION_INFO，改由本回调提供
++ * region 的 size/offset/flags 以及 cap 链；不再转发到 .ioctl。
++ */
++static int nv_vfio_mdev_get_region_info_caps(struct vfio_device *core_vdev,
++                                             struct vfio_region_info *info,
++                                             struct vfio_info_cap *caps)
++{
++    vgpu_dev_t *vgpu_dev = nv_get_vgpu_from_vdev(core_vdev);
++
++    if (!vgpu_dev)
++        return -EINVAL;
++
++    return nv_vgpu_vfio_region_info(vgpu_dev, info, caps);
++}
++#endif
++
+ static long nv_vfio_mdev_unlocked_ioctl(struct vfio_device *core_vdev,
+                      unsigned int cmd, unsigned long arg)
+ {
+@@ -529,6 +547,9 @@
+     .release        = nv_vfio_mdev_release,
+ #endif
+     .ioctl          = nv_vfio_mdev_unlocked_ioctl,
++#if defined(NV_VFIO_DEVICE_OPS_HAS_GET_REGION_INFO_CAPS)
++    .get_region_info_caps = nv_vfio_mdev_get_region_info_caps,
++#endif
+     .read           = nv_vfio_mdev_read,
+     .write          = nv_vfio_mdev_write,
+     .mmap           = nv_vfio_mdev_mmap,

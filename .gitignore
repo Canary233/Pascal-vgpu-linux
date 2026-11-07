@@ -1,0 +1,8 @@
+# 驱动包 / ISO / 构建产物不入库
+*.run
+*.iso
+*.tok
+*.exe
+*.deb
+*.log
+/var/tmp/
